@@ -26,7 +26,7 @@ HTML_TEMPLATE = """
         button:hover { background: #1557b0; }
         button:disabled { background: #bdc3c7; cursor: not-allowed; }
         #status { margin-top: 20px; color: #5f6368; font-weight: bold; text-align: center; }
-        #result { white-space: pre-wrap; background: #f8f9fa; padding: 20px; margin-top: 20px; border-radius: 8px; border: 1px solid #dadce0; display: none; }
+        #result { white-space: pre-wrap; background: #f8f9fa; padding: 20px; margin-top: 20px; border-radius: 8px; border: 1px solid #dadce0; display: none; font-size: 15px;}
     </style>
 </head>
 <body>
@@ -54,7 +54,7 @@ HTML_TEMPLATE = """
             formData.append('audio', fileInput.files[0]);
             
             btn.disabled = true;
-            status.innerText = '⏳ 正在轉碼與 AI 處理中，長錄音請稍候...';
+            status.innerText = '⏳ 正在轉碼與 AI 處理中，長錄音請耐心等候 1-3 分鐘...';
             result.style.display = 'none';
 
             try {
@@ -69,7 +69,7 @@ HTML_TEMPLATE = """
                     status.innerText = '❌ 錯誤：' + data.error;
                 }
             } catch (e) {
-                status.innerText = '❌ 連線逾時，請檢查伺服器日誌（長錄音處理中）。';
+                status.innerText = '❌ 連線逾時，請檢查伺服器日誌。';
             } finally {
                 btn.disabled = false;
             }
@@ -97,20 +97,15 @@ def upload_file():
         # 儲存原始檔案
         file.save(input_path)
         
-        # 1. 使用系統 FFmpeg 壓縮為低位元率單聲道 (32k bp)，確保長音檔不會超過 Groq 的檔案大小限制
+        # 1. FFmpeg 壓縮 (確保大小不超標)
         subprocess.run([
             'ffmpeg', '-i', input_path, 
-            '-y', 
-            '-ar', '16000', 
-            '-ac', '1', 
-            '-b:a', '32k', 
+            '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', 
             output_path
         ], check=True)
         
-        # 2. 初始化 Groq (不傳遞任何 proxies 參數，解決之前的報錯)
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        
-        # 3. Groq Whisper 轉錄
+        # 2. Groq 聽寫 (設定 300 秒超時，防止 60 分鐘錄音斷線)
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=300.0)
         with open(output_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
                 file=(os.path.basename(output_path), audio_file.read()),
@@ -118,8 +113,7 @@ def upload_file():
                 language="zh"
             )
 
-        # 4. OpenRouter Qwen-Plus 轉書面語
-        # 這一步將廣東話口語轉換為專業的香港政府格式書面語
+        # 3. OpenRouter Qwen 潤飾 (設定 300 秒超時)
         api_key = os.environ.get("OPENROUTER_API_KEY")
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -130,7 +124,8 @@ def upload_file():
                     {"role": "system", "content": "你是一位專業的香港政府行政主任(EO)。請將以下錄音逐字稿，在保留所有核心事實與數據的前提下，整理成一份嚴謹、用詞精確、語氣莊重的書面語報告。"},
                     {"role": "user", "content": transcription.text}
                 ]
-            }
+            },
+            timeout=300.0
         )
         
         ai_content = response.json().get('choices', [{}])[0].get('message', {}).get('content', '處理失敗')
@@ -140,11 +135,10 @@ def upload_file():
         print(f"Error occurred: {str(e)}")
         return jsonify({'error': str(e)}), 500
     finally:
-        # 務必清理臨時檔案，防止磁碟空間耗盡
+        # 清理臨時檔案
         if os.path.exists(input_path): os.remove(input_path)
         if os.path.exists(output_path): os.remove(output_path)
 
 if __name__ == '__main__':
-    # 這裡的 PORT 必須配合 Railway 的環境變數
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
