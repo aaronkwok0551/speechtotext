@@ -6,6 +6,7 @@ import requests
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+# Railway 環境建議使用 /tmp 資料夾處理臨時檔案
 app.config['UPLOAD_FOLDER'] = '/tmp'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -16,48 +17,62 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <title>AI 粵語公文助理</title>
     <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; line-height: 1.6; background: #f9f9f9; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        h2 { color: #2c3e50; }
-        button { background: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; }
-        button:disabled { background: #94a3b8; }
-        #status { margin-top: 15px; color: #64748b; font-weight: bold; }
-        #result { margin-top: 20px; white-space: pre-wrap; background: #f1f5f9; padding: 15px; border-radius: 8px; display: none; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 650px; margin: 40px auto; padding: 20px; line-height: 1.6; background-color: #f0f2f5; }
+        .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); }
+        h2 { color: #1a73e8; margin-top: 0; }
+        .input-group { margin: 20px 0; }
+        input[type="file"] { display: block; margin-bottom: 20px; }
+        button { background: #1a73e8; color: white; border: none; padding: 14px 28px; border-radius: 8px; cursor: pointer; font-size: 16px; width: 100%; transition: 0.3s; }
+        button:hover { background: #1557b0; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        #status { margin-top: 20px; color: #5f6368; font-weight: bold; text-align: center; }
+        #result { white-space: pre-wrap; background: #f8f9fa; padding: 20px; margin-top: 20px; border-radius: 8px; border: 1px solid #dadce0; display: none; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h2>🎙️ AI 粵語轉公文</h2>
-        <p>上傳錄音檔（支援 60 分鐘長錄音），自動生成書面語報告。</p>
-        <input type="file" id="audio" accept="audio/*">
-        <button id="btn" onclick="process()">開始處理</button>
+        <h2>🎙️ AI 粵語轉書面語公文</h2>
+        <p>上傳會議或訪談錄音，自動生成正式書面語報告。</p>
+        <div class="input-group">
+            <input type="file" id="audioFile" accept="audio/*">
+            <button id="submitBtn" onclick="processAudio()">開始生成報告</button>
+        </div>
         <div id="status"></div>
         <div id="result"></div>
     </div>
+
     <script>
-        async function process() {
-            const file = document.getElementById('audio').files[0];
-            if (!file) return alert('請選擇檔案');
-            const btn = document.getElementById('btn');
+        async function processAudio() {
+            const fileInput = document.getElementById('audioFile');
             const status = document.getElementById('status');
             const result = document.getElementById('result');
+            const btn = document.getElementById('submitBtn');
+            
+            if (!fileInput.files[0]) return alert('請先選擇錄音檔案');
+            
+            const formData = new FormData();
+            formData.append('audio', fileInput.files[0]);
             
             btn.disabled = true;
-            status.innerText = '⏳ 處理中...（長錄音請稍候 1-2 分鐘）';
+            status.innerText = '⏳ 正在轉碼與 AI 處理中，長錄音請稍候...';
             result.style.display = 'none';
 
-            const fd = new FormData();
-            fd.append('audio', file);
             try {
-                const res = await fetch('/upload', { method: 'POST', body: fd });
-                const data = await res.json();
-                if (res.ok) {
+                const response = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await response.json();
+                
+                if (response.ok) {
                     result.innerText = data.text;
                     result.style.display = 'block';
-                    status.innerText = '✅ 完成！';
-                } else { status.innerText = '❌ 錯誤：' + data.error; }
-            } catch (e) { status.innerText = '❌ 連線超時，請檢查日誌。'; }
-            finally { btn.disabled = false; }
+                    status.innerText = '✅ 生成成功！';
+                } else {
+                    status.innerText = '❌ 錯誤：' + data.error;
+                }
+            } catch (e) {
+                status.innerText = '❌ 連線逾時，請檢查伺服器日誌（長錄音處理中）。';
+            } finally {
+                btn.disabled = false;
+            }
         }
     </script>
 </body>
@@ -65,36 +80,71 @@ HTML_TEMPLATE = """
 """
 
 @app.route('/')
-def index(): return render_template_string(HTML_TEMPLATE)
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/upload', methods=['POST'])
-def upload():
+def upload_file():
+    if 'audio' not in request.files:
+        return jsonify({'error': '沒有上傳檔案'}), 400
+    
     file = request.files['audio']
-    in_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
-    out_path = in_path + ".mp3"
+    filename = secure_filename(file.filename)
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"processed_{filename}.mp3")
+    
     try:
-        file.save(in_path)
-        # 壓縮轉檔 (32k 碼率保證 1 小時音檔能傳給 Groq)
-        subprocess.run(['ffmpeg', '-i', in_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', out_path], check=True)
+        # 儲存原始檔案
+        file.save(input_path)
         
-        # Groq 聽寫
+        # 1. 使用系統 FFmpeg 壓縮為低位元率單聲道 (32k bp)，確保長音檔不會超過 Groq 的檔案大小限制
+        subprocess.run([
+            'ffmpeg', '-i', input_path, 
+            '-y', 
+            '-ar', '16000', 
+            '-ac', '1', 
+            '-b:a', '32k', 
+            output_path
+        ], check=True)
+        
+        # 2. 初始化 Groq (不傳遞任何 proxies 參數，解決之前的報錯)
         client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        with open(output_path, "rb") as f:
-            ts = client.audio.transcriptions.create(file=(out_path, f.read()), model="whisper-large-v3", language="zh")
         
-        # OpenRouter 轉書面語
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {os.environ.get('OPENROUTER_API_KEY')}"},
-            json={"model": "qwen/qwen-plus", "messages": [
-                {"role": "system", "content": "你是一位香港政府行政主任，請將以下廣東話逐字稿整理成嚴謹的書面語報告。"},
-                {"role": "user", "content": ts.text}
-            ]}
+        # 3. Groq Whisper 轉錄
+        with open(output_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=(os.path.basename(output_path), audio_file.read()),
+                model="whisper-large-v3",
+                language="zh"
+            )
+
+        # 4. OpenRouter Qwen-Plus 轉書面語
+        # 這一步將廣東話口語轉換為專業的香港政府格式書面語
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "qwen/qwen-plus",
+                "messages": [
+                    {"role": "system", "content": "你是一位專業的香港政府行政主任(EO)。請將以下錄音逐字稿，在保留所有核心事實與數據的前提下，整理成一份嚴謹、用詞精確、語氣莊重的書面語報告。"},
+                    {"role": "user", "content": transcription.text}
+                ]
+            }
         )
-        return jsonify({'text': res.json()['choices'][0]['message']['content']})
-    except Exception as e: return jsonify({'error': str(e)}), 500
+        
+        ai_content = response.json().get('choices', [{}])[0].get('message', {}).get('content', '處理失敗')
+        return jsonify({'text': ai_content})
+
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
+        return jsonify({'error': str(e)}), 500
     finally:
-        for p in [in_path, out_path]:
-            if os.path.exists(p): os.remove(p)
+        # 務必清理臨時檔案，防止磁碟空間耗盡
+        if os.path.exists(input_path): os.remove(input_path)
+        if os.path.exists(output_path): os.remove(output_path)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # 這裡的 PORT 必須配合 Railway 的環境變數
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
