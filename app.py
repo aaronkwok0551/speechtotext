@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify, render_template_string
 from groq import Groq
 import requests
 from werkzeug.utils import secure_filename
+import imageio_ffmpeg
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = '/tmp' if os.environ.get('RAILWAY_ENVIRONMENT') else 'uploads'
@@ -95,8 +96,11 @@ def upload_file():
     try:
         file.save(input_path)
         
-        # 1. 使用 FFmpeg 轉檔為 mp3
-        subprocess.run(['ffmpeg', '-i', input_path, '-y', '-ar', '16000', '-ac', '1', '-map', '0:a:', output_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 1. 使用 FFmpeg 轉檔為 mp3 1. 取得 Python 版 FFmpeg 的絕對路徑
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # 使用自帶的 FFmpeg 轉檔 (加入 -b:a 32k 確保 60 分鐘音檔不會超過 25MB 限制)
+        subprocess.run([ffmpeg_exe, '-i', input_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', output_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # 2. 呼叫 Groq API (Whisper) 產生逐字稿
         client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
