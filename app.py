@@ -1,9 +1,7 @@
 import os
 import subprocess
-import time
-from flask import Flask, request, jsonify, render_template_string
-from groq import Groq
 import requests
+from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -15,49 +13,54 @@ HTML_TEMPLATE = """
 <html lang="zh-HK">
 <head>
     <meta charset="UTF-8">
-    <title>AI 粵語公文助理 - 穩定版</title>
+    <title>AI 粵語公文助理 - 終極穩定版</title>
     <style>
-        body { font-family: sans-serif; max-width: 650px; margin: 40px auto; padding: 20px; background-color: #f0f2f5; }
-        .card { background: white; padding: 30px; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); }
-        button { background: #1a73e8; color: white; border: none; padding: 14px; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; }
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; background-color: #f4f7f6; }
+        .container { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h2 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        button { background: #3498db; color: white; border: none; padding: 12px 25px; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; margin-top: 10px; }
         button:disabled { background: #bdc3c7; }
-        #status { margin: 20px 0; font-weight: bold; text-align: center; }
-        #result { white-space: pre-wrap; background: #f8f9fa; padding: 20px; border-radius: 8px; border: 1px solid #dadce0; display: none; }
+        #status { margin-top: 15px; color: #e67e22; font-weight: bold; }
+        #result { white-space: pre-wrap; background: #fff; padding: 20px; margin-top: 20px; border-radius: 8px; border-left: 5px solid #3498db; display: none; box-shadow: inset 0 0 10px rgba(0,0,0,0.05); }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h2>🎙️ AI 粵語轉公文 (穩定重試版)</h2>
+    <div class="container">
+        <h2>🎙️ AI 粵語公文助理</h2>
+        <p>上傳錄音檔（支援 10-60 分鐘長度），系統將自動生成專業書面語報告。</p>
         <input type="file" id="audioFile" accept="audio/*">
-        <button id="submitBtn" onclick="process()">開始生成</button>
+        <button id="submitBtn" onclick="uploadFile()">開始處理</button>
         <div id="status"></div>
         <div id="result"></div>
     </div>
     <script>
-        async function process() {
-            const file = document.getElementById('audioFile').files[0];
-            if (!file) return alert('請選擇檔案');
-            const btn = document.getElementById('submitBtn');
+        async function uploadFile() {
+            const fileInput = document.getElementById('audioFile');
             const status = document.getElementById('status');
             const result = document.getElementById('result');
+            const btn = document.getElementById('submitBtn');
+            if (!fileInput.files[0]) return alert('請選擇檔案');
+            const formData = new FormData();
+            formData.append('audio', fileInput.files[0]);
             btn.disabled = true;
-            status.innerText = '⏳ 處理中，請耐心等候...';
+            status.innerText = '⏳ 正在轉碼並連線 AI 伺服器...（請耐心等候 1-2 分鐘）';
             result.style.display = 'none';
             try {
-                const res = await fetch('/upload', { method: 'POST', body: new FormData().append('audio', file) || new FormData() });
-                // 修正 FormData 傳遞
-                const fd = new FormData(); fd.append('audio', file);
-                const response = await fetch('/upload', { method: 'POST', body: fd });
+                const response = await fetch('/upload', { method: 'POST', body: formData });
                 const data = await response.json();
                 if (response.ok) {
                     result.innerText = data.text;
                     result.style.display = 'block';
-                    status.innerText = '✅ 成功';
+                    status.innerText = '✅ 生成完成！';
                 } else {
                     status.innerText = '❌ 錯誤：' + data.error;
+                    if(data.details) console.log(data.details);
                 }
-            } catch (e) { status.innerText = '❌ 連線異常，請查看 Railway Logs'; }
-            finally { btn.disabled = false; }
+            } catch (e) {
+                status.innerText = '❌ 網頁連線超時，但 AI 可能仍在後台處理中。';
+            } finally {
+                btn.disabled = false;
+            }
         }
     </script>
 </body>
@@ -65,65 +68,66 @@ HTML_TEMPLATE = """
 """
 
 @app.route('/')
-def index(): return render_template_string(HTML_TEMPLATE)
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
     file = request.files.get('audio')
-    if not file: return jsonify({'error': 'No file'}), 400
+    if not file: return jsonify({'error': '未找到檔案'}), 400
     
-    in_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
-    out_path = in_path + ".mp3"
+    filename = secure_filename(file.filename)
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"final_{filename}.mp3")
     
     try:
-        file.save(in_path)
-        # 轉碼
-        subprocess.run(['ffmpeg', '-i', in_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', out_path], check=True)
+        file.save(input_path)
         
-        # --- Groq 聽寫 (帶重試機制) ---
-        transcript_text = ""
-        for i in range(3): # 最多試 3 次
-            try:
-                client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=300.0)
-                with open(out_path, "rb") as f:
-                    ts = client.audio.transcriptions.create(file=(out_path, f.read()), model="whisper-large-v3", language="zh")
-                transcript_text = ts.text
-                break
-            except Exception as e:
-                if i == 2: raise Exception(f"Groq 連線失敗: {str(e)}")
-                time.sleep(2)
+        # 1. FFmpeg 壓縮 (32k 碼率)
+        subprocess.run(['ffmpeg', '-i', input_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', output_path], check=True)
+        
+        # 2. 直接用 API Request 呼叫 Groq (不使用 SDK)
+        groq_key = os.environ.get("GROQ_API_KEY")
+        with open(output_path, "rb") as f:
+            groq_response = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {groq_key}"},
+                files={"file": (os.path.basename(output_path), f)},
+                data={"model": "whisper-large-v3", "language": "zh"},
+                timeout=300
+            )
+        
+        if groq_response.status_code != 200:
+            return jsonify({'error': f'Groq API 報錯: {groq_response.text}'}), 500
+        
+        transcript_text = groq_response.json().get('text', '')
 
-        # --- OpenRouter 潤飾 (帶重試機制) ---
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        final_content = ""
-        for i in range(3):
-            try:
-                resp = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": "qwen/qwen-plus",
-                        "messages": [
-                            {"role": "system", "content": "你是一位專業的香港政府行政主任。請將錄音逐字稿整理成嚴謹的書面語公文。"},
-                            {"role": "user", "content": transcript_text}
-                        ]
-                    },
-                    timeout=300.0
-                )
-                resp.raise_for_status()
-                final_content = resp.json()['choices'][0]['message']['content']
-                break
-            except Exception as e:
-                if i == 2: raise Exception(f"AI 整理失敗: {str(e)}")
-                time.sleep(2)
-
-        return jsonify({'text': final_content})
+        # 3. 直接呼叫 OpenRouter
+        open_key = os.environ.get("OPENROUTER_API_KEY")
+        ai_response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {open_key}", "Content-Type": "application/json"},
+            json={
+                "model": "qwen/qwen-plus",
+                "messages": [
+                    {"role": "system", "content": "你是一位專業的香港政府行政主任(EO)。請將以下錄音整理成嚴謹、專業的中文書面語公文。"},
+                    {"role": "user", "content": transcript_text}
+                ]
+            },
+            timeout=300
+        )
+        
+        if ai_response.status_code != 200:
+            return jsonify({'error': f'OpenRouter 報錯: {ai_response.text}'}), 500
+            
+        final_text = ai_response.json()['choices'][0]['message']['content']
+        return jsonify({'text': final_text})
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'系統異常: {str(e)}'}), 500
     finally:
-        if os.path.exists(in_path): os.remove(in_path)
-        if os.path.exists(out_path): os.remove(out_path)
+        if os.path.exists(input_path): os.remove(input_path)
+        if os.path.exists(output_path): os.remove(output_path)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
