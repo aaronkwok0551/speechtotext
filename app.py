@@ -4,7 +4,7 @@ import logging
 import traceback
 from flask import Flask, request, jsonify, render_template_string
 import requests
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from werkzeug.utils import secure_filename
 
 # 設定日誌，讓 Railway 的 Deploy Logs 可以看到詳細資訊
@@ -105,12 +105,16 @@ def upload_file():
         groq_key = os.environ.get("GROQ_API_KEY")
         if not groq_key: raise ValueError("缺少 GROQ_API_KEY 環境變數")
         
-        client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
+        # 關閉 max_retries，避免遇到 429 錯誤時伺服器無限空轉等待
+        client = OpenAI(
+            api_key=groq_key, 
+            base_url="https://api.groq.com/openai/v1",
+            max_retries=0 
+        )
         
         whisper_prompt = (
-            "這是一段香港政府保安局禁毒處、房屋局的會議紀錄。內容包含：獨立審查組(ICU)、"
-            "穗禾苑、安基苑、宏福苑、屋邨維修、棚架安全、啟德體育園、抗毒宣傳、"
-            "冰毒、及政府行政公文用語。請用繁體中文及正確術語。"
+            "這是一段香港政府保安局禁毒處、房屋局的會議紀錄。"
+            "請用繁體中文及正確術語。"
         )
         
         with open(output_path, "rb") as audio_file:
@@ -131,14 +135,14 @@ def upload_file():
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {open_key}",
-                "HTTP-Referer": "https://railway.app", # OpenRouter 要求的自定義 Header
+                "HTTP-Referer": "https://railway.app", 
             },
             json={
                 "model": "qwen/qwen-plus",
                 "messages": [
                     {
                         "role": "system", 
-                        "content": "你是一位香港政府高級行政主任(SEO)。請將以下內容整理成專業書面語公文，採用政府公函格式，去除重複贅字，語氣嚴謹。"
+                        "content": "你是一位香港政府高級行政主任(SEO)。請將以下內容整理成專業書面語，去除重複贅字。"
                     },
                     {"role": "user", "content": transcription}
                 ]
@@ -154,11 +158,13 @@ def upload_file():
         logger.info("--- 所有流程順利結束 ---")
         return jsonify({'text': final_text})
 
+    except RateLimitError as e:
+        logger.warning(f"Groq 額度超限: {str(e)}")
+        return jsonify({'error': 'Groq 語音轉文字的每小時免費額度已滿，請等待大約 10 分鐘後再試。'}), 429
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg 失敗: {e.stderr.decode() if e.stderr else str(e)}")
         return jsonify({'error': '錄音檔格式轉換失敗，請確保上傳的是有效的音訊檔。'}), 500
     except Exception as e:
-        # 這行會在 Railway Logs 印出具體是哪一行代碼出錯
         logger.error("系統發生異常!! 詳細追蹤如下:")
         logger.error(traceback.format_exc())
         return jsonify({'error': f'系統異常: {str(e)}'}), 500
