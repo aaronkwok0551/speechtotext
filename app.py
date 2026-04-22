@@ -1,9 +1,15 @@
 import os
 import subprocess
+import logging
+import traceback
 from flask import Flask, request, jsonify, render_template_string
 import requests
 from openai import OpenAI
 from werkzeug.utils import secure_filename
+
+# 設定日誌，讓 Railway 的 Deploy Logs 可以看到詳細資訊
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = '/tmp'
@@ -14,6 +20,7 @@ HTML_TEMPLATE = """
 <html lang="zh-HK">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI 粵語公文助理 - 專業版</title>
     <style>
         body { font-family: -apple-system, system-ui, sans-serif; max-width: 650px; margin: 40px auto; padding: 20px; line-height: 1.6; background-color: #f0f2f5; }
@@ -44,7 +51,7 @@ HTML_TEMPLATE = """
             const result = document.getElementById('result');
             
             btn.disabled = true;
-            status.innerText = '⏳ 正在轉碼與 AI 分析中...（請耐心等候）';
+            status.innerText = '⏳ 正在處理中（轉碼 -> 聽寫 -> 潤飾）...';
             result.style.display = 'none';
 
             const fd = new FormData();
@@ -61,7 +68,7 @@ HTML_TEMPLATE = """
                     status.innerText = '❌ 錯誤：' + data.error;
                 }
             } catch (e) {
-                status.innerText = '❌ 連線逾時，請檢查網絡。';
+                status.innerText = '❌ 連線失敗，請檢查網路或 Railway Logs。';
             } finally {
                 btn.disabled = false;
             }
@@ -82,59 +89,78 @@ def upload_file():
     
     filename = secure_filename(file.filename)
     input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"final_{filename}.mp3")
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"conv_{filename}.mp3")
     
     try:
+        logger.info(f"--- 開始處理檔案: {filename} ---")
         file.save(input_path)
         
-        # 1. FFmpeg 壓縮 (維持 32k 以確保長錄音穩定傳輸)
-        subprocess.run(['ffmpeg', '-i', input_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', output_path], check=True)
+        # 1. FFmpeg 壓縮
+        logger.info("步驟 1: FFmpeg 轉碼中...")
+        subprocess.run(['ffmpeg', '-i', input_path, '-y', '-ar', '16000', '-ac', '1', '-b:a', '32k', output_path], 
+                       check=True, capture_output=True)
         
-        # 2. 使用 OpenAI SDK 套殼連線 Groq
-        client = OpenAI(
-            api_key=os.environ.get("GROQ_API_KEY"),
-            base_url="https://api.groq.com/openai/v1"
-        )
+        # 2. Groq 聽寫
+        logger.info("步驟 2: 傳送到 Groq (Whisper-large-v3)...")
+        groq_key = os.environ.get("GROQ_API_KEY")
+        if not groq_key: raise ValueError("缺少 GROQ_API_KEY 環境變數")
         
-        # --- 重點優化：Prompt 提示詞 ---
-        # 這裡加入了你常處理的專有名詞，引導 AI 使用繁體中文及正確術語
+        client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
+        
         whisper_prompt = (
             "這是一段香港政府保安局禁毒處、房屋局的會議紀錄。內容包含：獨立審查組(ICU)、"
             "穗禾苑、安基苑、宏福苑、屋邨維修、棚架安全、啟德體育園、抗毒宣傳、"
-            "冰毒、及政府行政公文用語。標點符號：，。！？"
+            "冰毒、及政府行政公文用語。請用繁體中文及正確術語。"
         )
         
         with open(output_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
                 model="whisper-large-v3",
                 file=audio_file,
-                prompt=whisper_prompt,  # 注入優化後的提示
+                prompt=whisper_prompt,
                 response_format="text"
             )
-        
-        # 3. 呼叫 OpenRouter 進行 EO 級別潤飾
+        logger.info("Groq 聽寫完成。")
+
+        # 3. OpenRouter 潤飾
+        logger.info("步驟 3: 傳送到 OpenRouter (Qwen-plus) 潤飾...")
         open_key = os.environ.get("OPENROUTER_API_KEY")
+        if not open_key: raise ValueError("缺少 OPENROUTER_API_KEY 環境變數")
+
         ai_resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {open_key}"},
+            headers={
+                "Authorization": f"Bearer {open_key}",
+                "HTTP-Referer": "https://railway.app", # OpenRouter 要求的自定義 Header
+            },
             json={
                 "model": "qwen/qwen-plus",
                 "messages": [
                     {
                         "role": "system", 
-                        "content": "你是一位香港政府高級行政主任(SEO/EO)。請將以下錄音內容整理成專業的中文書面語公文，"
-                                   "採用政府公函或內部會議紀錄格式，去除重複贅字，用詞需嚴謹莊重。若提及屋苑維修或禁毒事宜，請確保術語準確。"
+                        "content": "你是一位香港政府高級行政主任(SEO)。請將以下內容整理成專業書面語公文，採用政府公函格式，去除重複贅字，語氣嚴謹。"
                     },
                     {"role": "user", "content": transcription}
                 ]
             },
-            timeout=300
+            timeout=120
         )
         
+        if ai_resp.status_code != 200:
+            logger.error(f"OpenRouter 錯誤: {ai_resp.text}")
+            return jsonify({'error': f'OpenRouter 回應異常: {ai_resp.status_code}'}), 500
+
         final_text = ai_resp.json()['choices'][0]['message']['content']
+        logger.info("--- 所有流程順利結束 ---")
         return jsonify({'text': final_text})
 
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg 失敗: {e.stderr.decode() if e.stderr else str(e)}")
+        return jsonify({'error': '錄音檔格式轉換失敗，請確保上傳的是有效的音訊檔。'}), 500
     except Exception as e:
+        # 這行會在 Railway Logs 印出具體是哪一行代碼出錯
+        logger.error("系統發生異常!! 詳細追蹤如下:")
+        logger.error(traceback.format_exc())
         return jsonify({'error': f'系統異常: {str(e)}'}), 500
     finally:
         if os.path.exists(input_path): os.remove(input_path)
